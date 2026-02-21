@@ -1,9 +1,9 @@
-import { useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Camera, Mesh, Plane, Program, Renderer, Texture, Transform } from "ogl";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { DonationEvent } from "@/data/events";
+import { motion, AnimatePresence } from "framer-motion";
 
 import imgHuracan from "@/assets/event-huracan.jpg";
 import imgInundaciones from "@/assets/event-inundaciones.jpg";
@@ -17,85 +17,505 @@ const imageMap: Record<string, string> = {
   sequia: imgSequia,
 };
 
+// --- WebGL Gallery internals ---
+
+function debounce(func: (...args: any[]) => void, wait: number) {
+  let timeout: ReturnType<typeof setTimeout>;
+  return function (this: any, ...args: any[]) {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func.apply(this, args), wait);
+  };
+}
+
+function lerp(p1: number, p2: number, t: number) {
+  return p1 + (p2 - p1) * t;
+}
+
+function autoBind(instance: any) {
+  const proto = Object.getPrototypeOf(instance);
+  Object.getOwnPropertyNames(proto).forEach((key) => {
+    if (key !== "constructor" && typeof instance[key] === "function") {
+      instance[key] = instance[key].bind(instance);
+    }
+  });
+}
+
+function createTextTexture(
+  gl: any,
+  text: string,
+  font = "bold 30px monospace",
+  color = "black"
+) {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d")!;
+  context.font = font;
+  const metrics = context.measureText(text);
+  const textWidth = Math.ceil(metrics.width);
+  const textHeight = Math.ceil(parseInt(font, 10) * 1.2);
+  canvas.width = textWidth + 20;
+  canvas.height = textHeight + 20;
+  context.font = font;
+  context.fillStyle = color;
+  context.textBaseline = "middle";
+  context.textAlign = "center";
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillText(text, canvas.width / 2, canvas.height / 2);
+  const texture = new Texture(gl, { generateMipmaps: false });
+  texture.image = canvas;
+  return { texture, width: canvas.width, height: canvas.height };
+}
+
+class TitleMesh {
+  mesh: any;
+  constructor({ gl, plane, renderer, text, textColor = "#ffffff", font = "bold 30px DM Sans" }: any) {
+    autoBind(this);
+    const { texture, width, height } = createTextTexture(gl, text, font, textColor);
+    const geometry = new Plane(gl);
+    const program = new Program(gl, {
+      vertex: `
+        attribute vec3 position;
+        attribute vec2 uv;
+        uniform mat4 modelViewMatrix;
+        uniform mat4 projectionMatrix;
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragment: `
+        precision highp float;
+        uniform sampler2D tMap;
+        varying vec2 vUv;
+        void main() {
+          vec4 color = texture2D(tMap, vUv);
+          if (color.a < 0.1) discard;
+          gl_FragColor = color;
+        }
+      `,
+      uniforms: { tMap: { value: texture } },
+      transparent: true,
+    });
+    this.mesh = new Mesh(gl, { geometry, program });
+    const aspect = width / height;
+    const textHeight2 = plane.scale.y * 0.15;
+    const textWidth2 = textHeight2 * aspect;
+    this.mesh.scale.set(textWidth2, textHeight2, 1);
+    this.mesh.position.y = -plane.scale.y * 0.5 - textHeight2 * 0.5 - 0.05;
+    this.mesh.setParent(plane);
+  }
+}
+
+class MediaItem {
+  extra = 0;
+  geometry: any;
+  gl: any;
+  image: string;
+  index: number;
+  length: number;
+  renderer: any;
+  scene: any;
+  screen: any;
+  text: string;
+  viewport: any;
+  bend: number;
+  textColor: string;
+  borderRadius: number;
+  font: string;
+  program: any;
+  plane: any;
+  title: any;
+  scale = 1;
+  padding = 2;
+  width = 0;
+  widthTotal = 0;
+  x = 0;
+  speed = 0;
+  isBefore = false;
+  isAfter = false;
+
+  constructor(opts: any) {
+    Object.assign(this, opts);
+    this.createShader();
+    this.createMesh();
+    this.createTitle();
+    this.onResize();
+  }
+
+  createShader() {
+    const texture = new Texture(this.gl, { generateMipmaps: true });
+    this.program = new Program(this.gl, {
+      depthTest: false,
+      depthWrite: false,
+      vertex: `
+        precision highp float;
+        attribute vec3 position;
+        attribute vec2 uv;
+        uniform mat4 modelViewMatrix;
+        uniform mat4 projectionMatrix;
+        uniform float uTime;
+        uniform float uSpeed;
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          vec3 p = position;
+          p.z = (sin(p.x * 4.0 + uTime) * 1.5 + cos(p.y * 2.0 + uTime) * 1.5) * (0.1 + uSpeed * 0.5);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+        }
+      `,
+      fragment: `
+        precision highp float;
+        uniform vec2 uImageSizes;
+        uniform vec2 uPlaneSizes;
+        uniform sampler2D tMap;
+        uniform float uBorderRadius;
+        varying vec2 vUv;
+        float roundedBoxSDF(vec2 p, vec2 b, float r) {
+          vec2 d = abs(p) - b;
+          return length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - r;
+        }
+        void main() {
+          vec2 ratio = vec2(
+            min((uPlaneSizes.x / uPlaneSizes.y) / (uImageSizes.x / uImageSizes.y), 1.0),
+            min((uPlaneSizes.y / uPlaneSizes.x) / (uImageSizes.y / uImageSizes.x), 1.0)
+          );
+          vec2 uv = vec2(
+            vUv.x * ratio.x + (1.0 - ratio.x) * 0.5,
+            vUv.y * ratio.y + (1.0 - ratio.y) * 0.5
+          );
+          vec4 color = texture2D(tMap, uv);
+          float d = roundedBoxSDF(vUv - 0.5, vec2(0.5 - uBorderRadius), uBorderRadius);
+          float edgeSmooth = 0.002;
+          float alpha = 1.0 - smoothstep(-edgeSmooth, edgeSmooth, d);
+          gl_FragColor = vec4(color.rgb, alpha);
+        }
+      `,
+      uniforms: {
+        tMap: { value: texture },
+        uPlaneSizes: { value: [0, 0] },
+        uImageSizes: { value: [0, 0] },
+        uSpeed: { value: 0 },
+        uTime: { value: 100 * Math.random() },
+        uBorderRadius: { value: this.borderRadius },
+      },
+      transparent: true,
+    });
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.src = this.image;
+    img.onload = () => {
+      texture.image = img;
+      this.program.uniforms.uImageSizes.value = [img.naturalWidth, img.naturalHeight];
+    };
+  }
+
+  createMesh() {
+    this.plane = new Mesh(this.gl, { geometry: this.geometry, program: this.program });
+    this.plane.setParent(this.scene);
+  }
+
+  createTitle() {
+    this.title = new TitleMesh({
+      gl: this.gl,
+      plane: this.plane,
+      renderer: this.renderer,
+      text: this.text,
+      textColor: this.textColor,
+      font: this.font,
+    });
+  }
+
+  update(scroll: any, direction: string) {
+    this.plane.position.x = this.x - scroll.current - this.extra;
+    const x = this.plane.position.x;
+    const H = this.viewport.width / 2;
+    if (this.bend === 0) {
+      this.plane.position.y = 0;
+      this.plane.rotation.z = 0;
+    } else {
+      const B_abs = Math.abs(this.bend);
+      const R = (H * H + B_abs * B_abs) / (2 * B_abs);
+      const effectiveX = Math.min(Math.abs(x), H);
+      const arc = R - Math.sqrt(R * R - effectiveX * effectiveX);
+      if (this.bend > 0) {
+        this.plane.position.y = -arc;
+        this.plane.rotation.z = -Math.sign(x) * Math.asin(effectiveX / R);
+      } else {
+        this.plane.position.y = arc;
+        this.plane.rotation.z = Math.sign(x) * Math.asin(effectiveX / R);
+      }
+    }
+    this.speed = scroll.current - scroll.last;
+    this.program.uniforms.uTime.value += 0.04;
+    this.program.uniforms.uSpeed.value = this.speed;
+    const planeOffset = this.plane.scale.x / 2;
+    const viewportOffset = this.viewport.width / 2;
+    this.isBefore = this.plane.position.x + planeOffset < -viewportOffset;
+    this.isAfter = this.plane.position.x - planeOffset > viewportOffset;
+    if (direction === "right" && this.isBefore) {
+      this.extra -= this.widthTotal;
+      this.isBefore = this.isAfter = false;
+    }
+    if (direction === "left" && this.isAfter) {
+      this.extra += this.widthTotal;
+      this.isBefore = this.isAfter = false;
+    }
+  }
+
+  onResize({ screen, viewport }: any = {}) {
+    if (screen) this.screen = screen;
+    if (viewport) this.viewport = viewport;
+    this.scale = this.screen.height / 1500;
+    this.plane.scale.y = (this.viewport.height * (900 * this.scale)) / this.screen.height;
+    this.plane.scale.x = (this.viewport.width * (700 * this.scale)) / this.screen.width;
+    this.program.uniforms.uPlaneSizes.value = [this.plane.scale.x, this.plane.scale.y];
+    this.padding = 2;
+    this.width = this.plane.scale.x + this.padding;
+    this.widthTotal = this.width * this.length;
+    this.x = this.width * this.index;
+  }
+}
+
+class GalleryApp {
+  container: HTMLElement;
+  scrollSpeed: number;
+  scroll: any;
+  onCheckDebounce: any;
+  renderer: any;
+  gl: any;
+  camera: any;
+  scene: any;
+  screen: any;
+  viewport: any;
+  planeGeometry: any;
+  medias: MediaItem[] = [];
+  mediasImages: any[] = [];
+  raf = 0;
+  isDown = false;
+  start = 0;
+  boundOnResize: any;
+  boundOnWheel: any;
+  boundOnTouchDown: any;
+  boundOnTouchMove: any;
+  boundOnTouchUp: any;
+
+  constructor(
+    container: HTMLElement,
+    {
+      items,
+      bend = 3,
+      textColor = "#ffffff",
+      borderRadius = 0.05,
+      font = "bold 30px DM Sans",
+      scrollSpeed = 2,
+      scrollEase = 0.05,
+    }: any = {}
+  ) {
+    this.container = container;
+    this.scrollSpeed = scrollSpeed;
+    this.scroll = { ease: scrollEase, current: 0, target: 0, last: 0 };
+    this.onCheckDebounce = debounce(this.onCheck.bind(this), 200);
+    this.createRenderer();
+    this.createCamera();
+    this.createScene();
+    this.onResize();
+    this.createGeometry();
+    this.createMedias(items, bend, textColor, borderRadius, font);
+    this.update();
+    this.addEventListeners();
+  }
+
+  createRenderer() {
+    this.renderer = new Renderer({ alpha: true, antialias: true, dpr: Math.min(window.devicePixelRatio || 1, 2) });
+    this.gl = this.renderer.gl;
+    this.gl.clearColor(0, 0, 0, 0);
+    this.container.appendChild(this.gl.canvas);
+  }
+
+  createCamera() {
+    this.camera = new Camera(this.gl);
+    this.camera.fov = 45;
+    this.camera.position.z = 20;
+  }
+
+  createScene() {
+    this.scene = new Transform();
+  }
+
+  createGeometry() {
+    this.planeGeometry = new Plane(this.gl, { heightSegments: 50, widthSegments: 100 });
+  }
+
+  createMedias(items: any[], bend: number, textColor: string, borderRadius: number, font: string) {
+    this.mediasImages = items.concat(items);
+    this.medias = this.mediasImages.map(
+      (data, index) =>
+        new MediaItem({
+          geometry: this.planeGeometry,
+          gl: this.gl,
+          image: data.image,
+          index,
+          length: this.mediasImages.length,
+          renderer: this.renderer,
+          scene: this.scene,
+          screen: this.screen,
+          text: data.text,
+          viewport: this.viewport,
+          bend,
+          textColor,
+          borderRadius,
+          font,
+        })
+    );
+  }
+
+  onTouchDown(e: any) {
+    this.isDown = true;
+    this.scroll.position = this.scroll.current;
+    this.start = e.touches ? e.touches[0].clientX : e.clientX;
+  }
+
+  onTouchMove(e: any) {
+    if (!this.isDown) return;
+    const x = e.touches ? e.touches[0].clientX : e.clientX;
+    const distance = (this.start - x) * (this.scrollSpeed * 0.025);
+    this.scroll.target = this.scroll.position + distance;
+  }
+
+  onTouchUp() {
+    this.isDown = false;
+    this.onCheck();
+  }
+
+  onWheel(e: any) {
+    const delta = e.deltaY || e.wheelDelta || e.detail;
+    this.scroll.target += (delta > 0 ? this.scrollSpeed : -this.scrollSpeed) * 0.2;
+    this.onCheckDebounce();
+  }
+
+  onCheck() {
+    if (!this.medias || !this.medias[0]) return;
+    const width = this.medias[0].width;
+    const itemIndex = Math.round(Math.abs(this.scroll.target) / width);
+    const item = width * itemIndex;
+    this.scroll.target = this.scroll.target < 0 ? -item : item;
+  }
+
+  onResize() {
+    this.screen = { width: this.container.clientWidth, height: this.container.clientHeight };
+    this.renderer.setSize(this.screen.width, this.screen.height);
+    this.camera.perspective({ aspect: this.screen.width / this.screen.height });
+    const fov = (this.camera.fov * Math.PI) / 180;
+    const height = 2 * Math.tan(fov / 2) * this.camera.position.z;
+    const width = height * this.camera.aspect;
+    this.viewport = { width, height };
+    if (this.medias) {
+      this.medias.forEach((media) => media.onResize({ screen: this.screen, viewport: this.viewport }));
+    }
+  }
+
+  update() {
+    this.scroll.current = lerp(this.scroll.current, this.scroll.target, this.scroll.ease);
+    const direction = this.scroll.current > this.scroll.last ? "right" : "left";
+    if (this.medias) {
+      this.medias.forEach((media) => media.update(this.scroll, direction));
+    }
+    this.renderer.render({ scene: this.scene, camera: this.camera });
+    this.scroll.last = this.scroll.current;
+    this.raf = window.requestAnimationFrame(this.update.bind(this));
+  }
+
+  addEventListeners() {
+    this.boundOnResize = this.onResize.bind(this);
+    this.boundOnWheel = this.onWheel.bind(this);
+    this.boundOnTouchDown = this.onTouchDown.bind(this);
+    this.boundOnTouchMove = this.onTouchMove.bind(this);
+    this.boundOnTouchUp = this.onTouchUp.bind(this);
+    window.addEventListener("resize", this.boundOnResize);
+    window.addEventListener("mousewheel", this.boundOnWheel);
+    window.addEventListener("wheel", this.boundOnWheel);
+    window.addEventListener("mousedown", this.boundOnTouchDown);
+    window.addEventListener("mousemove", this.boundOnTouchMove);
+    window.addEventListener("mouseup", this.boundOnTouchUp);
+    window.addEventListener("touchstart", this.boundOnTouchDown);
+    window.addEventListener("touchmove", this.boundOnTouchMove);
+    window.addEventListener("touchend", this.boundOnTouchUp);
+  }
+
+  destroy() {
+    window.cancelAnimationFrame(this.raf);
+    window.removeEventListener("resize", this.boundOnResize);
+    window.removeEventListener("mousewheel", this.boundOnWheel);
+    window.removeEventListener("wheel", this.boundOnWheel);
+    window.removeEventListener("mousedown", this.boundOnTouchDown);
+    window.removeEventListener("mousemove", this.boundOnTouchMove);
+    window.removeEventListener("mouseup", this.boundOnTouchUp);
+    window.removeEventListener("touchstart", this.boundOnTouchDown);
+    window.removeEventListener("touchmove", this.boundOnTouchMove);
+    window.removeEventListener("touchend", this.boundOnTouchUp);
+    if (this.renderer?.gl?.canvas?.parentNode) {
+      this.renderer.gl.canvas.parentNode.removeChild(this.renderer.gl.canvas);
+    }
+  }
+}
+
+// --- React Component ---
+
 interface Props {
   events: DonationEvent[];
   onSelectEvent: (event: DonationEvent) => void;
 }
 
 const CircularGallery = ({ events, onSelectEvent }: Props) => {
+  const containerRef = useRef<HTMLDivElement>(null);
   const [activeIndex, setActiveIndex] = useState(0);
 
-  const next = () => setActiveIndex((p) => (p + 1) % events.length);
-  const prev = () => setActiveIndex((p) => (p - 1 + events.length) % events.length);
+  const galleryItems = events.map((e) => ({
+    image: imageMap[e.image],
+    text: e.name,
+  }));
 
-  const getPosition = (index: number) => {
-    const diff = (index - activeIndex + events.length) % events.length;
-    if (diff === 0) return "center";
-    if (diff === 1 || (diff === events.length - 1 && events.length > 2)) return diff === 1 ? "right" : "left";
-    if (diff === events.length - 1) return "left";
-    if (diff === 2) return "far-right";
-    if (diff === events.length - 2) return "far-left";
-    return "hidden";
-  };
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const app = new GalleryApp(containerRef.current, {
+      items: galleryItems,
+      bend: 3,
+      textColor: "#ffffff",
+      borderRadius: 0.05,
+      font: "bold 28px DM Sans",
+      scrollSpeed: 2,
+      scrollEase: 0.05,
+    });
+    return () => app.destroy();
+  }, [events]);
 
-  const positionStyles: Record<string, { x: string; scale: number; z: number; opacity: number }> = {
-    center: { x: "0%", scale: 1, z: 30, opacity: 1 },
-    left: { x: "-110%", scale: 0.75, z: 20, opacity: 0.7 },
-    right: { x: "110%", scale: 0.75, z: 20, opacity: 0.7 },
-    "far-left": { x: "-180%", scale: 0.55, z: 10, opacity: 0.4 },
-    "far-right": { x: "180%", scale: 0.55, z: 10, opacity: 0.4 },
-    hidden: { x: "0%", scale: 0.3, z: 0, opacity: 0 },
-  };
-
-  const activeEvent = events[activeIndex];
+  const activeEvent = events[activeIndex % events.length];
   const progress = (activeEvent.raised / activeEvent.goal) * 100;
 
   return (
     <div className="w-full">
-      {/* Gallery */}
-      <div className="relative h-[300px] md:h-[400px] flex items-center justify-center mb-8">
-        {events.map((event, i) => {
-          const pos = getPosition(i);
-          const style = positionStyles[pos];
-          return (
-            <motion.div
-              key={event.id}
-              className="absolute cursor-pointer"
-              animate={{
-                x: style.x,
-                scale: style.scale,
-                opacity: style.opacity,
-                zIndex: style.z,
-              }}
-              transition={{ duration: 0.5, ease: "easeInOut" }}
-              onClick={() => setActiveIndex(i)}
-              style={{ translateX: "-50%", left: "50%" }}
-            >
-              <div className={`w-56 h-56 md:w-72 md:h-72 rounded-full overflow-hidden border-4 transition-colors ${
-                pos === "center" ? "border-accent shadow-2xl" : "border-border"
-              }`}>
-                <img
-                  src={imageMap[event.image]}
-                  alt={event.name}
-                  className="w-full h-full object-cover"
-                />
-              </div>
-            </motion.div>
-          );
-        })}
+      {/* WebGL Gallery */}
+      <div
+        ref={containerRef}
+        className="w-full h-[350px] md:h-[500px] cursor-grab active:cursor-grabbing mb-8"
+        style={{ overflow: "hidden" }}
+      />
 
-        <button
-          onClick={prev}
-          className="absolute left-2 md:left-8 top-1/2 -translate-y-1/2 z-40 p-2 rounded-full bg-card shadow-lg border border-border hover:bg-muted transition-colors"
-        >
-          <ChevronLeft className="h-5 w-5 text-foreground" />
-        </button>
-        <button
-          onClick={next}
-          className="absolute right-2 md:right-8 top-1/2 -translate-y-1/2 z-40 p-2 rounded-full bg-card shadow-lg border border-border hover:bg-muted transition-colors"
-        >
-          <ChevronRight className="h-5 w-5 text-foreground" />
-        </button>
+      {/* Event selector buttons */}
+      <div className="flex justify-center gap-3 mb-6 flex-wrap">
+        {events.map((event, i) => (
+          <button
+            key={event.id}
+            onClick={() => setActiveIndex(i)}
+            className={`px-4 py-2 rounded-full text-sm font-medium transition-all ${
+              i === activeIndex
+                ? "bg-accent text-accent-foreground shadow-md"
+                : "bg-muted text-muted-foreground hover:bg-muted/80"
+            }`}
+          >
+            {event.name.split("–")[0].trim()}
+          </button>
+        ))}
       </div>
 
       {/* Event Info */}
@@ -108,13 +528,16 @@ const CircularGallery = ({ events, onSelectEvent }: Props) => {
           transition={{ duration: 0.3 }}
           className="text-center max-w-lg mx-auto"
         >
-          <h3 className="text-2xl font-display font-bold text-foreground mb-2">{activeEvent.name}</h3>
+          <h3 className="text-2xl font-display font-bold text-foreground mb-2">
+            {activeEvent.name}
+          </h3>
           <p className="text-muted-foreground mb-4 text-sm">{activeEvent.description}</p>
           <div className="mb-4">
             <div className="flex justify-between text-sm mb-1.5">
               <span className="text-muted-foreground">Recaudado</span>
               <span className="font-semibold text-foreground">
-                ${activeEvent.raised.toLocaleString("es-MX")} / ${activeEvent.goal.toLocaleString("es-MX")} MXN
+                ${activeEvent.raised.toLocaleString("es-MX")} / $
+                {activeEvent.goal.toLocaleString("es-MX")} MXN
               </span>
             </div>
             <Progress value={progress} className="h-3 bg-muted" />
