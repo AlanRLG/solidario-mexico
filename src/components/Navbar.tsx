@@ -1,11 +1,44 @@
 import { Link, useLocation } from "react-router-dom";
-import { Heart } from "lucide-react";
+import { Heart, Wallet } from "lucide-react";
+import { useAccount, useConnect, useDisconnect } from "wagmi";
+import { Button } from "@/components/ui/button";
 
 const navItems = [
   { label: "Inicio", path: "/" },
   { label: "Eventos", path: "/eventos" },
   { label: "Sobre Nosotros", path: "/sobre-nosotros" },
 ];
+
+const WalletButton = () => {
+  const { address, isConnected } = useAccount();
+  const { connect, connectors } = useConnect();
+  const { disconnect } = useDisconnect();
+
+  if (isConnected && address) {
+    return (
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => disconnect()}
+        className="gap-2 font-mono text-xs"
+      >
+        <Wallet className="h-3 w-3 text-green-500" />
+        {address.slice(0, 6)}...{address.slice(-4)}
+      </Button>
+    );
+  }
+
+  return (
+    <Button
+      size="sm"
+      onClick={() => connect({ connector: connectors[0] })}
+      className="gap-2 bg-accent hover:bg-accent/90 text-accent-foreground"
+    >
+      <Wallet className="h-4 w-4" />
+      Conectar Wallet
+    </Button>
+  );
+};
 
 const Navbar = () => {
   const location = useLocation();
@@ -36,6 +69,9 @@ const Navbar = () => {
               </Link>
             );
           })}
+          <div className="ml-2">
+            <WalletButton />
+          </div>
         </nav>
       </div>
     </header>
